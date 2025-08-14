@@ -174,22 +174,24 @@ def detect_volume_spike(kline_data, threshold=2.5):
     return z_score > threshold, current_vol
 
 # ---------- Price Prediction Game ----------
-def check_prediction(symbol, prediction, pred_price, current_price):
-    if pred_price is None or current_price is None or prediction is None:
-        return None
-    if prediction == "Higher" and current_price > pred_price:
-        return True
-    if prediction == "Lower" and current_price < pred_price:
-        return True
-    return False
+def check_prediction(symbol, prediction, pred_price, final_price):
+    if pred_price is None or final_price is None or prediction is None:
+        return None, 0
+    price_diff = abs(final_price - pred_price)
+    if prediction == "แทงขึ้น" and final_price > pred_price:
+        return True, price_diff
+    if prediction == "แทงลง" and final_price < pred_price:
+        return True, price_diff
+    return False, price_diff
 
-def update_score(current_score, is_correct):
+def update_money(current_money, is_correct, price_diff):
     if is_correct is None:
-        return current_score
+        return current_money, 0
+    score = price_diff * 125 if is_correct else price_diff * 25
     if is_correct:
-        return current_score * 18 if current_score > 0 else 18
+        return current_money + score, score
     else:
-        return max(0, current_score - 2)
+        return current_money - score, -score
 
 def get_game_countdown(end_time):
     now = datetime.utcnow().replace(tzinfo=pytz.utc)
@@ -230,6 +232,21 @@ st.markdown("""
             font-weight: bold;
             margin-top: 10px;
         }
+        .bankrupt-box {
+            background-color: #ff0000;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .profit-positive {
+            color: #00ff99;
+        }
+        .profit-negative {
+            color: #ff3366;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -250,20 +267,28 @@ if "btc_prediction" not in st.session_state:
     st.session_state.btc_prediction = None
 if "eth_prediction" not in st.session_state:
     st.session_state.eth_prediction = None
-if "btc_session_score" not in st.session_state:
-    st.session_state.btc_session_score = 0
-if "eth_session_score" not in st.session_state:
-    st.session_state.eth_session_score = 0
-if "btc_total_score" not in st.session_state:
-    st.session_state.btc_total_score = 0
-if "eth_total_score" not in st.session_state:
-    st.session_state.eth_total_score = 0
+if "money" not in st.session_state:
+    st.session_state.money = 10000000  # Initialize with 10M USDT
+if "credits" not in st.session_state:
+    st.session_state.credits = 100  # Initialize with 100 credits
+if "score_history" not in st.session_state:
+    st.session_state.score_history = []  # Store past session money changes
+if "prediction_history" not in st.session_state:
+    st.session_state.prediction_history = []  # Store prediction history
+if "session_number" not in st.session_state:
+    st.session_state.session_number = 0  # Track session count
 if "game_end_time" not in st.session_state:
     st.session_state.game_end_time = None
 if "game_duration" not in st.session_state:
     st.session_state.game_duration = None
 if "game_active" not in st.session_state:
     st.session_state.game_active = False
+if "bankrupt" not in st.session_state:
+    st.session_state.bankrupt = False
+if "btc_final_price" not in st.session_state:
+    st.session_state.btc_final_price = None
+if "eth_final_price" not in st.session_state:
+    st.session_state.eth_final_price = None
 
 # ---------- Sidebar ----------
 st.sidebar.markdown("## ⚙️ ตั้งค่า Alert")
@@ -276,6 +301,31 @@ selected_tf = st.sidebar.selectbox("🕒 เลือกไทม์เฟรม
 
 st.sidebar.markdown("## 🎮 Price Prediction Game")
 st.sidebar.markdown("Predict whether the next price will be higher or lower!")
+st.sidebar.markdown(f"**เงินคงเหลือ**: {st.session_state.money:,.2f} USDT")
+profit_loss = st.session_state.money - 10000000
+profit_class = "profit-positive" if profit_loss >= 0 else "profit-negative"
+st.sidebar.markdown(f"<div class='{profit_class}'>**กำไร/ขาดทุน**: {profit_loss:+,.2f} USDT</div>", unsafe_allow_html=True)
+st.sidebar.markdown(f"**เครดิตคงเหลือ**: {st.session_state.credits}")
+
+# Exchange money for credits
+exchange_amount = st.sidebar.number_input("แลกเงินเป็นเครดิต (1,000 USDT = 1 เครดิต)", min_value=0.0, step=1000.0, format="%.2f")
+if st.sidebar.button("แลกเครดิต") and exchange_amount > 0:
+    credits_to_add = exchange_amount / 1000
+    if exchange_amount <= st.session_state.money:
+        st.session_state.credits += credits_to_add
+        st.session_state.money -= exchange_amount
+        st.session_state.prediction_history.append({
+            "เซสชัน": st.session_state.session_number,
+            "เหรียญ": "N/A",
+            "สถานะ": "แลกเครดิต",
+            "ราคาที่ทาย": "-",
+            "ราคาจริง": "-",
+            "เปลี่ยนแปลงเงิน": -exchange_amount,
+            "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+        })
+    else:
+        st.sidebar.error("เงินไม่พอสำหรับการแลกเครดิต!")
+
 game_duration_options = {
     "5 นาที": 5 * 60,
     "10 นาที": 10 * 60,
@@ -287,54 +337,138 @@ game_duration_options = {
     "1 สัปดาห์": 7 * 24 * 3600
 }
 game_duration_label = st.sidebar.selectbox("⏳ ระยะเวลาเกม", list(game_duration_options.keys()))
-btc_pred = st.sidebar.selectbox("BTC Prediction", ["Higher", "Lower"], key="btc_pred")
-eth_pred = st.sidebar.selectbox("ETH Prediction", ["Higher", "Lower"], key="eth_pred")
-if st.sidebar.button("เริ่มเกม"):
+btc_pred = st.sidebar.selectbox("BTC Prediction", ["แทงขึ้น", "แทงลง", "ไม่มี"], key="btc_pred", index=2)
+eth_pred = st.sidebar.selectbox("ETH Prediction", ["แทงขึ้น", "แทงลง", "ไม่มี"], key="eth_pred", index=2)
+
+# Check if enough credits to start game
+can_start = (st.session_state.credits >= 10 if btc_pred != "ไม่มี" and eth_pred != "ไม่มี" else
+             st.session_state.credits >= 5 if btc_pred != "ไม่มี" or eth_pred != "ไม่มี" else False)
+if st.sidebar.button("เริ่มเกม", disabled=not can_start or st.session_state.bankrupt):
     st.session_state.game_duration = game_duration_options[game_duration_label]
     st.session_state.game_end_time = datetime.utcnow().replace(tzinfo=pytz.utc) + timedelta(seconds=st.session_state.game_duration)
     st.session_state.game_active = True
-    st.session_state.btc_session_score = 0
-    st.session_state.eth_session_score = 0
-    st.session_state.btc_prediction = btc_pred
-    st.session_state.eth_prediction = eth_pred
-    st.session_state.btc_pred_price = get_price("BTCUSDT")
-    st.session_state.eth_pred_price = get_price("ETHUSDT")
+    st.session_state.btc_prediction = btc_pred if btc_pred != "ไม่มี" else None
+    st.session_state.eth_prediction = eth_pred if eth_pred != "ไม่มี" else None
+    st.session_state.btc_pred_price = get_price("BTCUSDT") if btc_pred != "ไม่มี" else None
+    st.session_state.eth_pred_price = get_price("ETHUSDT") if eth_pred != "ไม่มี" else None
+    st.session_state.btc_final_price = None
+    st.session_state.eth_final_price = None
+    st.session_state.credits -= 10 if btc_pred != "ไม่มี" and eth_pred != "ไม่มี" else 5
+    st.session_state.session_number += 1
+    st.session_state.bankrupt = False
 
-# New button to submit new predictions without restarting the session
-if st.session_state.game_active and st.sidebar.button("ส่งการทายใหม่"):
-    st.session_state.btc_prediction = btc_pred
-    st.session_state.eth_prediction = eth_pred
+# Submit new prediction with credit check
+can_submit = (st.session_state.game_active and not st.session_state.bankrupt and
+              ((btc_pred != "ไม่มี" and st.session_state.credits >= 5) or
+               (eth_pred != "ไม่มี" and st.session_state.credits >= 5) or
+               (btc_pred != "ไม่มี" and eth_pred != "ไม่มี" and st.session_state.credits >= 10)))
+if st.session_state.game_active and st.sidebar.button("ส่งการทายใหม่", disabled=not can_submit):
+    if btc_pred != "ไม่มี" and st.session_state.btc_prediction != btc_pred:
+        st.session_state.btc_prediction = btc_pred
+        st.session_state.btc_pred_price = get_price("BTCUSDT")
+        st.session_state.credits -= 5
+    if eth_pred != "ไม่มี" and st.session_state.eth_prediction != eth_pred:
+        st.session_state.eth_prediction = eth_pred
+        st.session_state.eth_pred_price = get_price("ETHUSDT")
+        st.session_state.credits -= 5 if btc_pred == "ไม่มี" or st.session_state.btc_prediction == btc_pred else 0
 
-if st.session_state.game_active:
+if st.session_state.game_active and not st.session_state.bankrupt:
     countdown = get_game_countdown(st.session_state.game_end_time)
     st.sidebar.markdown(f"**เวลาคงเหลือ**: {countdown}")
-    st.sidebar.markdown(f"**BTC Prediction**: {st.session_state.btc_prediction or 'None'}")
+    st.sidebar.markdown(f"**BTC สถานะ**: {st.session_state.btc_prediction or 'ไม่มี'}")
     st.sidebar.markdown(f"**BTC ราคาที่ทาย**: {format_big_price(st.session_state.btc_pred_price)}")
-    st.sidebar.markdown(f"**ETH Prediction**: {st.session_state.eth_prediction or 'None'}")
+    st.sidebar.markdown(f"**BTC ราคาเข้า**: {format_big_price(st.session_state.btc_entry)}")
+    st.sidebar.markdown(f"**ETH สถานะ**: {st.session_state.eth_prediction or 'ไม่มี'}")
     st.sidebar.markdown(f"**ETH ราคาที่ทาย**: {format_big_price(st.session_state.eth_pred_price)}")
-    st.sidebar.markdown(f"**BTC Session Score**: {st.session_state.btc_session_score}")
-    st.sidebar.markdown(f"**ETH Session Score**: {st.session_state.eth_session_score}")
-    st.sidebar.markdown(f"**BTC Total Score**: {st.session_state.btc_total_score}")
-    st.sidebar.markdown(f"**ETH Total Score**: {st.session_state.eth_total_score}")
+    st.sidebar.markdown(f"**ETH ราคาเข้า**: {format_big_price(st.session_state.eth_entry)}")
+    st.sidebar.markdown(f"**เงินคงเหลือ**: {st.session_state.money:,.2f} USDT")
+    st.sidebar.markdown(f"<div class='{profit_class}'>**กำไร/ขาดทุน**: {profit_loss:+,.2f} USDT</div>", unsafe_allow_html=True)
+    st.sidebar.markdown(f"**เครดิตคงเหลือ**: {st.session_state.credits}")
+
+# Display session history
+if st.session_state.score_history:
+    st.sidebar.markdown("## 📜 ประวัติเซสชัน")
+    score_df = pd.DataFrame(st.session_state.score_history, columns=["เซสชัน", "BTC Money Change", "ETH Money Change", "เวลา"])
+    score_df.index = score_df.index + 1
+    st.sidebar.dataframe(score_df, use_container_width=True)
+
+# Display prediction history
+if st.session_state.prediction_history:
+    st.sidebar.markdown("## 📜 ประวัติการทาย")
+    pred_df = pd.DataFrame(st.session_state.prediction_history, columns=["เซสชัน", "เหรียญ", "สถานะ", "ราคาที่ทาย", "ราคาจริง", "เปลี่ยนแปลงเงิน", "เวลา"])
+    pred_df.index = pred_df.index + 1
+    st.sidebar.dataframe(pred_df, use_container_width=True)
 
 st_autorefresh(interval=refresh_sec * 1000, key="auto_refresh")
 
 # ---------- Game Session Logic ----------
-if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >= st.session_state.game_end_time:
-    st.session_state.btc_total_score += st.session_state.btc_session_score
-    st.session_state.eth_total_score += st.session_state.eth_session_score
+if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >= st.session_state.game_end_time and not st.session_state.bankrupt:
+    # Store final prices before ending the game
+    st.session_state.btc_final_price = get_price("BTCUSDT") if st.session_state.btc_prediction is not None else None
+    st.session_state.eth_final_price = get_price("ETHUSDT") if st.session_state.eth_prediction is not None else None
+
+    initial_money = st.session_state.money
+    btc_money_change = 0
+    eth_money_change = 0
+
+    # Process BTC prediction
+    if st.session_state.btc_prediction is not None and st.session_state.btc_pred_price is not None and st.session_state.btc_final_price is not None:
+        btc_result, btc_price_diff = check_prediction("BTC", st.session_state.btc_prediction, st.session_state.btc_pred_price, st.session_state.btc_final_price)
+        st.session_state.money, btc_money_change = update_money(st.session_state.money, btc_result, btc_price_diff)
+        st.session_state.prediction_history.append({
+            "เซสชัน": st.session_state.session_number,
+            "เหรียญ": "BTC",
+            "สถานะ": st.session_state.btc_prediction,
+            "ราคาที่ทาย": format_big_price(st.session_state.btc_pred_price),
+            "ราคาจริง": format_big_price(st.session_state.btc_final_price),
+            "เปลี่ยนแปลงเงิน": btc_money_change,
+            "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    # Process ETH prediction
+    if st.session_state.eth_prediction is not None and st.session_state.eth_pred_price is not None and st.session_state.eth_final_price is not None:
+        eth_result, eth_price_diff = check_prediction("ETH", st.session_state.eth_prediction, st.session_state.eth_pred_price, st.session_state.eth_final_price)
+        st.session_state.money, eth_money_change = update_money(st.session_state.money, eth_result, eth_price_diff)
+        st.session_state.prediction_history.append({
+            "เซสชัน": st.session_state.session_number,
+            "เหรียญ": "ETH",
+            "สถานะ": st.session_state.eth_prediction,
+            "ราคาที่ทาย": format_big_price(st.session_state.eth_pred_price),
+            "ราคาจริง": format_big_price(st.session_state.eth_final_price),
+            "เปลี่ยนแปลงเงิน": eth_money_change,
+            "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    # Record session results
+    st.session_state.score_history.append({
+        "เซสชัน": st.session_state.session_number,
+        "BTC Money Change": btc_money_change,
+        "ETH Money Change": eth_money_change,
+        "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
+    })
+
+    # Check for bankruptcy
+    if st.session_state.money < 0:
+        st.session_state.bankrupt = True
+        st.markdown(
+            "<div class='bankrupt-box'>💥 พอร์ตคุณแตกแล้ว! กรุณาเริ่มเกมใหม่</div>",
+            unsafe_allow_html=True
+        )
+        st.session_state.money = 10000000  # Reset money
+        st.session_state.credits = 100  # Reset credits
+        st.session_state.session_number += 1
+
     st.markdown(
-        f"<div class='game-result'>🎮 เกมจบแล้ว! BTC Session Score: {st.session_state.btc_session_score}, "
-        f"ETH Session Score: {st.session_state.eth_session_score}</div>",
+        f"<div class='game-result'>🎮 เกมจบแล้ว! เงินคงเหลือ: {st.session_state.money:,.2f} USDT</div>",
         unsafe_allow_html=True
     )
     st.session_state.game_active = False
-    st.session_state.btc_session_score = 0
-    st.session_state.eth_session_score = 0
     st.session_state.btc_prediction = None
     st.session_state.eth_prediction = None
     st.session_state.btc_pred_price = None
     st.session_state.eth_pred_price = None
+    st.session_state.btc_final_price = None
+    st.session_state.eth_final_price = None
     st.session_state.game_end_time = None
 
 # ---------- Fetch Data ----------
@@ -345,18 +479,12 @@ eth_kline = get_kline_data("ETHUSDT", "1d", 2)
 btc_kline_tf = get_kline_data("BTCUSDT", timeframe_map.get(selected_tf, {"binance_interval": "4h"})["binance_interval"], history_len)
 eth_kline_tf = get_kline_data("ETHUSDT", timeframe_map.get(selected_tf, {"binance_interval": "4h"})["binance_interval"], history_len)
 
-# ---------- Price Prediction Game Logic ----------
-if st.session_state.game_active:
-    if btc is not None and st.session_state.btc_pred_price is not None and st.session_state.btc_prediction is not None:
-        btc_result = check_prediction("BTC", st.session_state.btc_prediction, st.session_state.btc_pred_price, btc)
-        st.session_state.btc_session_score = update_score(st.session_state.btc_session_score, btc_result)
-        if btc_result is not None:
-            st.session_state.btc_prediction = None  # Reset only prediction
-    if eth is not None and st.session_state.eth_pred_price is not None and st.session_state.eth_prediction is not None:
-        eth_result = check_prediction("ETH", st.session_state.eth_prediction, st.session_state.eth_pred_price, eth)
-        st.session_state.eth_session_score = update_score(st.session_state.eth_session_score, eth_result)
-        if eth_result is not None:
-            st.session_state.eth_prediction = None  # Reset only prediction
+# ---------- Store prices during game ----------
+if st.session_state.game_active and not st.session_state.bankrupt:
+    if btc is not None and st.session_state.btc_prediction is not None:
+        st.session_state.btc_final_price = btc
+    if eth is not None and st.session_state.eth_prediction is not None:
+        st.session_state.eth_final_price = eth
 
 # เก็บประวัติราคา
 if btc is not None:
