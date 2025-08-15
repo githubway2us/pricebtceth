@@ -7,12 +7,234 @@ from datetime import datetime, timedelta
 import pytz
 from streamlit_autorefresh import st_autorefresh
 import numpy as np
+import sqlite3
+import bcrypt
+import uuid
+import logging
+import os
+from dotenv import load_dotenv
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+# ตั้งค่า logging
+logging.basicConfig(filename='app.log', level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# โหลด environment variables
+load_dotenv()
 
 st.set_page_config(page_title="BTC & ETH Realtime + Alerts", layout="centered")
 
+# API Endpoints
 API = "https://api.binance.com/api/v3/ticker/price"
 KLINE_API = "https://api.binance.com/api/v3/klines"
 ORDER_BOOK_API = "https://api.binance.com/api/v3/depth"
+
+# ---------- SQLite Database Setup ----------
+def connect_db():
+    conn = sqlite3.connect('game_database.db')
+    # หากใช้ pysqlcipher3: conn.execute(f"PRAGMA key='{os.getenv('DB_KEY')}'")
+    return conn
+
+def init_db():
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT,
+        created_at TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER,
+        created_at TEXT,
+        expires_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        session_number INTEGER,
+        money REAL,
+        credits REAL,
+        btc_prediction TEXT,
+        eth_prediction TEXT,
+        btc_pred_price REAL,
+        eth_pred_price REAL,
+        btc_final_price REAL,
+        eth_final_price REAL,
+        timestamp TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS login_attempts (
+        username TEXT PRIMARY KEY,
+        attempts INTEGER DEFAULT 0,
+        last_attempt TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+# เรียกใช้เพื่อสร้างฐานข้อมูล
+init_db()
+
+# ---------- Leaderboard Function ----------
+def get_leaderboard(limit=10):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute('''SELECT u.username, s.money, s.credits, s.timestamp
+                 FROM users u
+                 JOIN scores s ON u.id = s.user_id
+                 WHERE s.id = (
+                     SELECT MAX(id)
+                     FROM scores
+                     WHERE user_id = u.id
+                 )
+                 ORDER BY s.money DESC
+                 LIMIT ?''', (limit,))
+    leaderboard = c.fetchall()
+    conn.close()
+    return pd.DataFrame(leaderboard, columns=["ชื่อผู้ใช้", "เงิน (USDT)", "เครดิต", "เวลาล่าสุด"]).reset_index().rename(columns={"index": "อันดับ"})
+
+# ---------- Authentication Functions ----------
+def hash_password(password):
+    try:
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    except Exception as e:
+        logging.error(f"Error hashing password: {e}")
+        raise
+
+def register_user(username, password):
+    if not (3 <= len(username) <= 50):
+        logging.warning(f"Invalid username length for {username}")
+        return False, "ชื่อผู้ใช้ต้องมีความยาว 3-50 ตัวอักษร"
+    if not (6 <= len(password) <= 50):
+        logging.warning(f"Invalid password length for {username}")
+        return False, "รหัสผ่านต้องมีความยาว 6-50 ตัวอักษร"
+    if not username.isalnum():
+        logging.warning(f"Invalid characters in username: {username}")
+        return False, "ชื่อผู้ใช้ต้องประกอบด้วยตัวอักษรและตัวเลขเท่านั้น"
+    
+    conn = connect_db()
+    c = conn.cursor()
+    # ตรวจสอบชื่อผู้ใช้ซ้ำก่อน
+    c.execute("SELECT id FROM users WHERE username = ?", (username,))
+    if c.fetchone():
+        conn.close()
+        logging.warning(f"Username {username} already exists")
+        return False, "ชื่อผู้ใช้นี้มีอยู่แล้ว"
+    
+    try:
+        hashed_password = hash_password(password)
+        c.execute("INSERT INTO users (username, password, created_at) VALUES (?, ?, ?)",
+                  (username, hashed_password, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        logging.info(f"User {username} registered successfully")
+        return True, "ลงทะเบียนสำเร็จ"
+    except sqlite3.Error as e:
+        logging.error(f"Database error during registration for {username}: {e}")
+        return False, f"เกิดข้อผิดพลาดในฐานข้อมูล: {str(e)}"
+    except Exception as e:
+        logging.error(f"Unexpected error during registration for {username}: {e}")
+        return False, f"เกิดข้อผิดพลาด: {str(e)}"
+    finally:
+        conn.close()
+
+def check_login_attempts(username):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT attempts, last_attempt FROM login_attempts WHERE username = ?", (username,))
+    result = c.fetchone()
+    if result and result[0] >= 5:
+        last_attempt = datetime.strptime(result[1], "%Y-%m-%d %H:%M:%S")
+        if (datetime.utcnow() - last_attempt).total_seconds() < 3600:
+            logging.warning(f"Account {username} is locked due to too many failed attempts")
+            return False
+    return True
+
+def update_login_attempts(username, success):
+    conn = connect_db()
+    c = conn.cursor()
+    if success:
+        c.execute("DELETE FROM login_attempts WHERE username = ?", (username,))
+    else:
+        c.execute("INSERT OR REPLACE INTO login_attempts (username, attempts, last_attempt) VALUES (?, COALESCE((SELECT attempts + 1 FROM login_attempts WHERE username = ?), 1), ?)",
+                  (username, username, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+
+def login_user(username, password):
+    if not check_login_attempts(username):
+        return None
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+    user = c.fetchone()
+    conn.close()
+    if user:
+        try:
+            if bcrypt.checkpw(password.encode('utf-8'), user[1].encode('utf-8')):
+                update_login_attempts(username, True)
+                logging.info(f"User {username} logged in successfully")
+                return user[0]
+            else:
+                update_login_attempts(username, False)
+                logging.warning(f"Failed login attempt for username: {username} (wrong password)")
+                return None
+        except ValueError as e:
+            logging.error(f"Invalid password hash for {username}: {e}")
+            update_login_attempts(username, False)
+            return None
+    else:
+        update_login_attempts(username, False)
+        logging.warning(f"Failed login attempt for username: {username} (user not found)")
+        return None
+
+def create_session(user_id):
+    token = str(uuid.uuid4())
+    expires_at = (datetime.utcnow() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+              (token, user_id, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), expires_at))
+    conn.commit()
+    conn.close()
+    return token
+
+def validate_session(token):
+    if not token:
+        return None
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id, expires_at FROM sessions WHERE token = ?", (token,))
+    session = c.fetchone()
+    conn.close()
+    if session and datetime.strptime(session[1], "%Y-%m-%d %H:%M:%S") > datetime.utcnow():
+        return session[0]
+    return None
+
+def save_score(user_id, session_number, money, credits, btc_prediction, eth_prediction, btc_pred_price, eth_pred_price, btc_final_price, eth_final_price):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute('''INSERT INTO scores (user_id, session_number, money, credits, btc_prediction, eth_prediction,
+                 btc_pred_price, eth_pred_price, btc_final_price, eth_final_price, timestamp)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (user_id, session_number, money, credits, btc_prediction, eth_prediction,
+               btc_pred_price, eth_pred_price, btc_final_price, eth_final_price, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+    logging.info(f"Saved score for user_id {user_id}, session {session_number}")
+
+def get_score_history(user_id):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute('''SELECT session_number, money, credits, btc_prediction, eth_prediction,
+                 btc_pred_price, eth_pred_price, btc_final_price, eth_final_price, timestamp
+                 FROM scores WHERE user_id = ? ORDER BY timestamp DESC''', (user_id,))
+    history = c.fetchall()
+    conn.close()
+    return pd.DataFrame(history, columns=["เซสชัน", "เงิน", "เครดิต", "BTC การทาย", "ETH การทาย",
+                                         "BTC ราคาทาย", "ETH ราคาทาย", "BTC ราคาจริง", "ETH ราคาจริง", "เวลา"])
 
 # ---------- Timeframe Map ----------
 timeframe_map = {
@@ -52,11 +274,18 @@ def get_market_status():
 
 # ---------- Helpers ----------
 def get_price(symbol: str):
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
     try:
-        r = requests.get(API, params={"symbol": symbol}, timeout=5)
+        r = session.get(API, params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
+        if r.status_code == 429:
+            time.sleep(60)
+            r = session.get(API, params={"symbol": symbol}, timeout=5)
         return float(r.json()["price"])
-    except:
+    except Exception as e:
+        logging.error(f"Failed to fetch price for {symbol}: {e}")
         return None
 
 def get_kline_data(symbol: str, interval: str, limit: int):
@@ -74,7 +303,8 @@ def get_kline_data(symbol: str, interval: str, limit: int):
         df["low"] = df["low"].astype(float)
         df["volume"] = df["volume"].astype(float)
         return df
-    except:
+    except Exception as e:
+        logging.error(f"Failed to fetch kline data for {symbol}: {e}")
         return None
 
 def get_order_book(symbol: str, limit: int = 100):
@@ -83,7 +313,8 @@ def get_order_book(symbol: str, limit: int = 100):
         r = requests.get(ORDER_BOOK_API, params=params, timeout=5)
         r.raise_for_status()
         return r.json()
-    except:
+    except Exception as e:
+        logging.error(f"Failed to fetch order book for {symbol}: {e}")
         return None
 
 def color_by_target(price, target):
@@ -247,10 +478,36 @@ st.markdown("""
         .profit-negative {
             color: #ff3366;
         }
+        .leaderboard-box {
+            background-color: #1a1a1a;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+        }
+        .leaderboard-box table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .leaderboard-box th, .leaderboard-box td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #444;
+        }
+        .leaderboard-box th {
+            background-color: #00ccff;
+            color: black;
+        }
+        .leaderboard-box tr:nth-child(even) {
+            background-color: #2a2a2a;
+        }
     </style>
 """, unsafe_allow_html=True)
 
 # ---------- Session State Initialization ----------
+if "session_token" not in st.session_state:
+    st.session_state.session_token = None
+if "username" not in st.session_state:
+    st.session_state.username = None
 if "btc_history" not in st.session_state:
     st.session_state.btc_history = []
 if "eth_history" not in st.session_state:
@@ -268,15 +525,15 @@ if "btc_prediction" not in st.session_state:
 if "eth_prediction" not in st.session_state:
     st.session_state.eth_prediction = None
 if "money" not in st.session_state:
-    st.session_state.money = 10000000  # Initialize with 10M USDT
+    st.session_state.money = 10000000
 if "credits" not in st.session_state:
-    st.session_state.credits = 100  # Initialize with 100 credits
+    st.session_state.credits = 100
 if "score_history" not in st.session_state:
-    st.session_state.score_history = []  # Store past session money changes
+    st.session_state.score_history = []
 if "prediction_history" not in st.session_state:
-    st.session_state.prediction_history = []  # Store prediction history
+    st.session_state.prediction_history = []
 if "session_number" not in st.session_state:
-    st.session_state.session_number = 0  # Track session count
+    st.session_state.session_number = 0
 if "game_end_time" not in st.session_state:
     st.session_state.game_end_time = None
 if "game_duration" not in st.session_state:
@@ -290,7 +547,76 @@ if "btc_final_price" not in st.session_state:
 if "eth_final_price" not in st.session_state:
     st.session_state.eth_final_price = None
 
+# ---------- Login/Register UI ----------
+st.sidebar.markdown("## 🔐 เข้าสู่ระบบ / ลงทะเบียน")
+if not st.session_state.session_token:
+    tab1, tab2 = st.sidebar.tabs(["เข้าสู่ระบบ", "ลงทะเบียน"])
+    
+    with tab1:
+        login_username = st.text_input("ชื่อผู้ใช้", key="login_username")
+        login_password = st.text_input("รหัสผ่าน", type="password", key="login_password")
+        if st.button("เข้าสู่ระบบ"):
+            if not check_login_attempts(login_username):
+                st.error("บัญชีถูกล็อกชั่วคราว กรุณาลองใหม่ใน 1 ชั่วโมง")
+            else:
+                user_id = login_user(login_username, login_password)
+                if user_id:
+                    st.session_state.session_token = create_session(user_id)
+                    st.session_state.username = login_username
+                    st.success(f"ยินดีต้อนรับ {login_username}!")
+                    score_history = get_score_history(user_id)
+                    if not score_history.empty:
+                        last_session = score_history.iloc[0]
+                        st.session_state.session_number = last_session["เซสชัน"]
+                        st.session_state.money = last_session["เงิน"]
+                        st.session_state.credits = last_session["เครดิต"]
+                    st.rerun()
+                else:
+                    st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+    
+    with tab2:
+        reg_username = st.text_input("ชื่อผู้ใช้ใหม่", key="reg_username")
+        reg_password = st.text_input("รหัสผ่านใหม่", type="password", key="reg_password")
+        if st.button("ลงทะเบียน"):
+            success, message = register_user(reg_username, reg_password)
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+else:
+    user_id = validate_session(st.session_state.session_token)
+    if user_id:
+        st.sidebar.markdown(f"**ผู้ใช้**: {st.session_state.username}")
+        if st.sidebar.button("ออกจากระบบ"):
+            conn = connect_db()
+            c = conn.cursor()
+            c.execute("DELETE FROM sessions WHERE token = ?", (st.session_state.session_token,))
+            conn.commit()
+            conn.close()
+            logging.info(f"User {st.session_state.username} logged out")
+            st.session_state.session_token = None
+            st.session_state.username = None
+            st.session_state.money = 10000000
+            st.session_state.credits = 100
+            st.session_state.score_history = []
+            st.session_state.prediction_history = []
+            st.session_state.session_number = 0
+            st.session_state.game_active = False
+            st.session_state.bankrupt = False
+            st.rerun()
+    else:
+        st.session_state.session_token = None
+        st.session_state.username = None
+        st.markdown("<div class='alert-box'>⚠️ เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่</div>", unsafe_allow_html=True)
+        st.rerun()
+
+# Restrict game access if not logged in
+if not st.session_state.session_token or not validate_session(st.session_state.session_token):
+    st.markdown("<div class='alert-box'>⚠️ กรุณาเข้าสู่ระบบเพื่อเล่นเกม!</div>", unsafe_allow_html=True)
+    st.stop()
+
 # ---------- Sidebar ----------
+user_id = validate_session(st.session_state.session_token)
 st.sidebar.markdown("## ⚙️ ตั้งค่า Alert")
 btc_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย BTC", min_value=0.0, value=70000.0, step=100.0, format="%.2f")
 eth_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย ETH", min_value=0.0, value=3500.0, step=10.0, format="%.2f")
@@ -323,6 +649,13 @@ if st.sidebar.button("แลกเครดิต") and exchange_amount > 0:
             "เปลี่ยนแปลงเงิน": -exchange_amount,
             "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
         })
+        save_score(
+            user_id,
+            st.session_state.session_number,
+            st.session_state.money,
+            st.session_state.credits,
+            None, None, None, None, None, None
+        )
     else:
         st.sidebar.error("เงินไม่พอสำหรับการแลกเครดิต!")
 
@@ -356,6 +689,18 @@ if st.sidebar.button("เริ่มเกม", disabled=not can_start or st.se
     st.session_state.credits -= 10 if btc_pred != "ไม่มี" and eth_pred != "ไม่มี" else 5
     st.session_state.session_number += 1
     st.session_state.bankrupt = False
+    save_score(
+        user_id,
+        st.session_state.session_number,
+        st.session_state.money,
+        st.session_state.credits,
+        st.session_state.btc_prediction,
+        st.session_state.eth_prediction,
+        st.session_state.btc_pred_price,
+        st.session_state.eth_pred_price,
+        None, None
+    )
+    logging.info(f"User {st.session_state.username} started game session {st.session_state.session_number}")
 
 # Submit new prediction with credit check
 can_submit = (st.session_state.game_active and not st.session_state.bankrupt and
@@ -371,6 +716,18 @@ if st.session_state.game_active and st.sidebar.button("ส่งการทา�
         st.session_state.eth_prediction = eth_pred
         st.session_state.eth_pred_price = get_price("ETHUSDT")
         st.session_state.credits -= 5 if btc_pred == "ไม่มี" or st.session_state.btc_prediction == btc_pred else 0
+    save_score(
+        user_id,
+        st.session_state.session_number,
+        st.session_state.money,
+        st.session_state.credits,
+        st.session_state.btc_prediction,
+        st.session_state.eth_prediction,
+        st.session_state.btc_pred_price,
+        st.session_state.eth_pred_price,
+        None, None
+    )
+    logging.info(f"User {st.session_state.username} submitted new prediction for session {st.session_state.session_number}")
 
 if st.session_state.game_active and not st.session_state.bankrupt:
     countdown = get_game_countdown(st.session_state.game_end_time)
@@ -399,11 +756,28 @@ if st.session_state.prediction_history:
     pred_df.index = pred_df.index + 1
     st.sidebar.dataframe(pred_df, use_container_width=True)
 
+# Display user score history from database
+if user_id:
+    st.sidebar.markdown("## 📊 ประวัติคะแนนย้อนหลัง")
+    score_history = get_score_history(user_id)
+    if not score_history.empty:
+        st.sidebar.dataframe(score_history, use_container_width=True)
+
+# Display leaderboard
+st.sidebar.markdown("## 🏆 กระดานผู้นำ")
+leaderboard_df = get_leaderboard()
+if not leaderboard_df.empty:
+    leaderboard_df["อันดับ"] = leaderboard_df["อันดับ"] + 1  # ปรับอันดับให้เริ่มที่ 1
+    leaderboard_df["เงิน (USDT)"] = leaderboard_df["เงิน (USDT)"].apply(lambda x: f"{x:,.2f}")
+    leaderboard_df["เครดิต"] = leaderboard_df["เครดิต"].apply(lambda x: f"{x:,.2f}")
+    st.sidebar.dataframe(leaderboard_df[["อันดับ", "ชื่อผู้ใช้", "เงิน (USDT)", "เครดิต"]], use_container_width=True)
+else:
+    st.sidebar.markdown("<div class='alert-box'>ไม่มีข้อมูลในกระดานผู้นำ</div>", unsafe_allow_html=True)
+
 st_autorefresh(interval=refresh_sec * 1000, key="auto_refresh")
 
 # ---------- Game Session Logic ----------
 if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >= st.session_state.game_end_time and not st.session_state.bankrupt:
-    # Store final prices before ending the game
     st.session_state.btc_final_price = get_price("BTCUSDT") if st.session_state.btc_prediction is not None else None
     st.session_state.eth_final_price = get_price("ETHUSDT") if st.session_state.eth_prediction is not None else None
 
@@ -411,7 +785,6 @@ if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >
     btc_money_change = 0
     eth_money_change = 0
 
-    # Process BTC prediction
     if st.session_state.btc_prediction is not None and st.session_state.btc_pred_price is not None and st.session_state.btc_final_price is not None:
         btc_result, btc_price_diff = check_prediction("BTC", st.session_state.btc_prediction, st.session_state.btc_pred_price, st.session_state.btc_final_price)
         st.session_state.money, btc_money_change = update_money(st.session_state.money, btc_result, btc_price_diff)
@@ -425,7 +798,6 @@ if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >
             "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    # Process ETH prediction
     if st.session_state.eth_prediction is not None and st.session_state.eth_pred_price is not None and st.session_state.eth_final_price is not None:
         eth_result, eth_price_diff = check_prediction("ETH", st.session_state.eth_prediction, st.session_state.eth_pred_price, st.session_state.eth_final_price)
         st.session_state.money, eth_money_change = update_money(st.session_state.money, eth_result, eth_price_diff)
@@ -439,7 +811,6 @@ if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >
             "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    # Record session results
     st.session_state.score_history.append({
         "เซสชัน": st.session_state.session_number,
         "BTC Money Change": btc_money_change,
@@ -447,16 +818,36 @@ if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >
         "เวลา": datetime.utcnow().replace(tzinfo=pytz.utc).strftime("%Y-%m-%d %H:%M:%S")
     })
 
-    # Check for bankruptcy
+    save_score(
+        user_id,
+        st.session_state.session_number,
+        st.session_state.money,
+        st.session_state.credits,
+        st.session_state.btc_prediction,
+        st.session_state.eth_prediction,
+        st.session_state.btc_pred_price,
+        st.session_state.eth_pred_price,
+        st.session_state.btc_final_price,
+        st.session_state.eth_final_price
+    )
+
     if st.session_state.money < 0:
         st.session_state.bankrupt = True
         st.markdown(
             "<div class='bankrupt-box'>💥 พอร์ตคุณแตกแล้ว! กรุณาเริ่มเกมใหม่</div>",
             unsafe_allow_html=True
         )
-        st.session_state.money = 10000000  # Reset money
-        st.session_state.credits = 100  # Reset credits
+        st.session_state.money = 10000000
+        st.session_state.credits = 100
         st.session_state.session_number += 1
+        save_score(
+            user_id,
+            st.session_state.session_number,
+            st.session_state.money,
+            st.session_state.credits,
+            None, None, None, None, None, None
+        )
+        logging.info(f"User {st.session_state.username} went bankrupt in session {st.session_state.session_number}")
 
     st.markdown(
         f"<div class='game-result'>🎮 เกมจบแล้ว! เงินคงเหลือ: {st.session_state.money:,.2f} USDT</div>",
@@ -470,6 +861,7 @@ if st.session_state.game_active and datetime.utcnow().replace(tzinfo=pytz.utc) >
     st.session_state.btc_final_price = None
     st.session_state.eth_final_price = None
     st.session_state.game_end_time = None
+    logging.info(f"User {st.session_state.username} ended game session {st.session_state.session_number}")
 
 # ---------- Fetch Data ----------
 btc = get_price("BTCUSDT")
