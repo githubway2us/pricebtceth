@@ -43,6 +43,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
         password TEXT,
+        chat_level INTEGER DEFAULT 1,
         created_at TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS sessions (
@@ -71,6 +72,13 @@ def init_db():
         username TEXT PRIMARY KEY,
         attempts INTEGER DEFAULT 0,
         last_attempt TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS chat_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        chat_count INTEGER,
+        timestamp TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
     )''')
     conn.commit()
     conn.close()
@@ -117,7 +125,6 @@ def register_user(username, password):
     
     conn = connect_db()
     c = conn.cursor()
-    # ตรวจสอบชื่อผู้ใช้ซ้ำก่อน
     c.execute("SELECT id FROM users WHERE username = ?", (username,))
     if c.fetchone():
         conn.close()
@@ -126,8 +133,8 @@ def register_user(username, password):
     
     try:
         hashed_password = hash_password(password)
-        c.execute("INSERT INTO users (username, password, created_at) VALUES (?, ?, ?)",
-                  (username, hashed_password, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+        c.execute("INSERT INTO users (username, password, chat_level, created_at) VALUES (?, ?, ?, ?)",
+                  (username, hashed_password, 1, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
         logging.info(f"User {username} registered successfully")
         return True, "ลงทะเบียนสำเร็จ"
@@ -235,6 +242,51 @@ def get_score_history(user_id):
     conn.close()
     return pd.DataFrame(history, columns=["เซสชัน", "เงิน", "เครดิต", "BTC การทาย", "ETH การทาย",
                                          "BTC ราคาทาย", "ETH ราคาทาย", "BTC ราคาจริง", "ETH ราคาจริง", "เวลา"])
+
+# ---------- Chat Level Functions ----------
+def log_chat(user_id):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO chat_logs (user_id, chat_count, timestamp) VALUES (?, 1, ?)",
+              (user_id, datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    
+    # นับจำนวนแชททั้งหมดของผู้ใช้
+    c.execute("SELECT SUM(chat_count) FROM chat_logs WHERE user_id = ?", (user_id,))
+    total_chats = c.fetchone()[0] or 0
+    
+    # กำหนดระดับตามจำนวนแชท (ทุก 10 แชทเพิ่ม 1 ระดับ)
+    new_level = max(1, total_chats // 10)
+    
+    # อัปเดตระดับในตาราง users
+    c.execute("UPDATE users SET chat_level = ? WHERE id = ?", (new_level, user_id))
+    conn.commit()
+    conn.close()
+    return new_level
+
+def get_chat_level(user_id):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT chat_level FROM users WHERE id = ?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else 1
+
+def get_total_users():
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total = c.fetchone()[0]
+    conn.close()
+    return total
+
+def get_chat_history(user_id):
+    conn = connect_db()
+    c = conn.cursor()
+    c.execute("SELECT chat_count, timestamp FROM chat_logs WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+    history = c.fetchall()
+    conn.close()
+    return pd.DataFrame(history, columns=["จำนวนแชท", "เวลา"])
 
 # ---------- Timeframe Map ----------
 timeframe_map = {
@@ -587,6 +639,25 @@ else:
     user_id = validate_session(st.session_state.session_token)
     if user_id:
         st.sidebar.markdown(f"**ผู้ใช้**: {st.session_state.username}")
+        st.sidebar.markdown(f"**ระดับการแชท**: {get_chat_level(user_id)}")
+        st.sidebar.markdown(f"**จำนวนผู้ใช้ที่สมัคร**: {get_total_users()}")
+        
+        # เพิ่มช่องแชท
+        st.sidebar.markdown("## 💬 แชท")
+        chat_input = st.sidebar.text_input("พิมพ์ข้อความ:", key="chat_input")
+        if st.sidebar.button("ส่งข้อความ"):
+            if chat_input:
+                log_chat(user_id)
+                st.sidebar.success(f"ข้อความส่งแล้ว! ระดับปัจจุบัน: {get_chat_level(user_id)}")
+            else:
+                st.sidebar.error("กรุณาพิมพ์ข้อความก่อนส่ง")
+        
+        # แสดงประวัติการแชท
+        st.sidebar.markdown("## 📜 ประวัติการแชท")
+        chat_history = get_chat_history(user_id)
+        if not chat_history.empty:
+            st.sidebar.dataframe(chat_history, use_container_width=True)
+        
         if st.sidebar.button("ออกจากระบบ"):
             conn = connect_db()
             c = conn.cursor()
@@ -767,7 +838,7 @@ if user_id:
 st.sidebar.markdown("## 🏆 กระดานผู้นำ")
 leaderboard_df = get_leaderboard()
 if not leaderboard_df.empty:
-    leaderboard_df["อันดับ"] = leaderboard_df["อันดับ"] + 1  # ปรับอันดับให้เริ่มที่ 1
+    leaderboard_df["อันดับ"] = leaderboard_df["อันดับ"] + 1
     leaderboard_df["เงิน (USDT)"] = leaderboard_df["เงิน (USDT)"].apply(lambda x: f"{x:,.2f}")
     leaderboard_df["เครดิต"] = leaderboard_df["เครดิต"].apply(lambda x: f"{x:,.2f}")
     st.sidebar.dataframe(leaderboard_df[["อันดับ", "ชื่อผู้ใช้", "เงิน (USDT)", "เครดิต"]], use_container_width=True)
