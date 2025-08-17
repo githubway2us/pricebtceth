@@ -643,20 +643,20 @@ else:
         st.sidebar.markdown(f"**จำนวนผู้ใช้ที่สมัคร**: {get_total_users()}")
         
         # เพิ่มช่องแชท
-        st.sidebar.markdown("## 💬 แชท")
-        chat_input = st.sidebar.text_input("พิมพ์ข้อความ:", key="chat_input")
-        if st.sidebar.button("ส่งข้อความ"):
-            if chat_input:
-                log_chat(user_id)
-                st.sidebar.success(f"ข้อความส่งแล้ว! ระดับปัจจุบัน: {get_chat_level(user_id)}")
-            else:
-                st.sidebar.error("กรุณาพิมพ์ข้อความก่อนส่ง")
+        #st.sidebar.markdown("## 💬 แชท")
+        #hat_input = st.sidebar.text_input("พิมพ์ข้อความ:", key="chat_input")
+        #if st.sidebar.button("ส่งข้อความ"):
+            #if chat_input:
+                #log_chat(user_id)
+                #st.sidebar.success(f"ข้อความส่งแล้ว! ระดับปัจจุบัน: {get_chat_level(user_id)}")
+            #else:
+                #st.sidebar.error("กรุณาพิมพ์ข้อความก่อนส่ง")
         
         # แสดงประวัติการแชท
-        st.sidebar.markdown("## 📜 ประวัติการแชท")
-        chat_history = get_chat_history(user_id)
-        if not chat_history.empty:
-            st.sidebar.dataframe(chat_history, use_container_width=True)
+        st.sidebar.markdown("## 📜 https://github.com/githubway2us/pricebtceth")
+        #chat_history = get_chat_history(user_id)
+        #if not chat_history.empty:
+            #st.sidebar.dataframe(chat_history, use_container_width=True)
         
         if st.sidebar.button("ออกจากระบบ"):
             conn = connect_db()
@@ -689,8 +689,8 @@ if not st.session_state.session_token or not validate_session(st.session_state.s
 # ---------- Sidebar ----------
 user_id = validate_session(st.session_state.session_token)
 st.sidebar.markdown("## ⚙️ ตั้งค่า Alert")
-btc_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย BTC", min_value=0.0, value=70000.0, step=100.0, format="%.2f")
-eth_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย ETH", min_value=0.0, value=3500.0, step=10.0, format="%.2f")
+btc_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย BTC", min_value=0.0, value=120000.0, step=100.0, format="%.2f")
+eth_target = st.sidebar.number_input("🎯 ราคาเป้าหมาย ETH", min_value=0.0, value=4500.0, step=10.0, format="%.2f")
 refresh_sec = st.sidebar.slider("⏱ รอบอัปเดต (วินาที)", 1, 10, 2)
 history_len = st.sidebar.slider("📊 จำนวนจุดกราฟ", 10, 200, 50)
 vol_threshold = st.sidebar.slider("📈 เกณฑ์ Volume Spike (Z-score)", 1.0, 5.0, 2.5, 0.1)
